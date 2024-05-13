@@ -4,6 +4,3 @@
 *.pkl
 *.onnx
 *.engine
-
-/env
-/nafnet/.eggs

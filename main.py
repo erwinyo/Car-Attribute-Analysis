@@ -1,25 +1,44 @@
 import cv2
+import torch
+import torch.nn as nn
 import numpy as np
+import supervision as sv
 
-from yolo_detector import YoloDetector
-from nafnet import NAFNet
 from attibute_analysis_detector import VehicleAttribute, ColorDetector
+from yolo_detector import YoloDetector
+
+# Device agnostic code
+device = torch.device("cuda:0" if torch.cuda.is_available() else "")
+
+
+def calculate_average_pooling(img, size_of_pool=3):
+    height, width, channel = img.shape
+    if height < size_of_pool or width < size_of_pool:
+        return
+
+    img = torch.from_numpy(img).float().to(device)
+    img = torch.permute(img, (2, 0, 1))         # Change the input size to (channel, height, width)
+
+    # Average Pooling
+    pool = nn.AvgPool2d(kernel_size=size_of_pool, stride=size_of_pool).to(device)
+    output = pool(img)
+    output = torch.permute(output, (1, 2, 0)).detach().cpu().numpy()  # Back to size of (height, width, channel)
+    return output
+
 
 if __name__ == '__main__':
-    vehicle_detector = YoloDetector(yolo_model="asset/model/yolo/yolov8l.pt")
-    # license_plate_detector = YoloDetector(yolo_model="asset/model/license_plate/lpr_fast.pt")
-    # deblur = NAFNet()
+    # Define all required objects
+    yolo = YoloDetector(yolo_model="asset/model/yolo/yolov8l.pt")
     vehicle_attribute = VehicleAttribute()
     color_detector = ColorDetector()
+    bounding_box_annotator = sv.BoundingBoxAnnotator(
+        color=sv.ColorPalette.DEFAULT
+    )
+    label_annotator = sv.LabelAnnotator(
+        color=sv.ColorPalette.ROBOFLOW
+    )
 
-    # Set up the NAFNet
-    # opt_path = 'nafnet/options/test/REDS/NAFNet-width64.yml'
-    # opt = deblur.parse(opt_path)
-    # opt['dist'] = False
-    # model = deblur.create_model(opt)
-    # deblur.set_model(model=model)
-
-    cap = cv2.VideoCapture("asset/video/sample#1.mp4")
+    cap = cv2.VideoCapture("asset/video/sample#2.mp4")
     while True:
         has_frame, frame = cap.read()
         if not has_frame:
@@ -27,26 +46,58 @@ if __name__ == '__main__':
         h, w = frame.shape[:2]
         return_value = []
 
-        padding = 0
-        result_car_detection = vehicle_detector.track(frame, classes=[1, 2, 3, 5, 7], conf=0.8)
-        boxes = result_car_detection.boxes.xyxy.clone().tolist()
-        for x1, y1, x2, y2 in boxes:
+        result_car_detection = yolo.track(frame, classes=[1, 2, 3, 5, 7], conf=0.65)
+        detections = sv.Detections.from_ultralytics(result_car_detection)
+        if detections.tracker_id is None:
+            continue
+
+        # Supervision annotation
+        labels = [
+            f"{tracker_id} {class_name} {confidence:.2f}"
+            for tracker_id, class_name, confidence
+            in zip(detections.tracker_id, detections['class_name'], detections.confidence)
+        ]
+        annotated_frame = bounding_box_annotator.annotate(
+            scene=frame.copy(),
+            detections=detections
+        )
+        annotated_frame = label_annotator.annotate(
+            scene=annotated_frame, detections=detections, labels=labels
+        )
+
+        # For loop of vehicle detections
+        for x1, y1, x2, y2 in detections.xyxy:
             x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-            x1, y1, x2, y2 = x1-padding, y1-padding, x2+padding, y2+padding
-            x1, y1, x2, y2 = max(x1, 0), max(y1, 0), min(x2, w), min(y2, h)
+            mid_x, mid_y = int(x1 + ((x2 - x1) / 2)), int(y1 + ((y2 - y1) / 2))
+
             car = frame[y1:y2, x1:x2]
             car = cv2.cvtColor(car, cv2.COLOR_BGR2RGB)
 
             # Attribute Analysis
-            result = next(vehicle_attribute.get_attribute(car))[0]
+            result = next(vehicle_attribute.get_attribute(car))[0]  # use next() because it generator
             attributes = result['attributes']
+            """
+                variable 'attributes' will output like this,
+                
+                OUTPUT CAN BE VARY : 
+                    - "Color: (golden, prob: 0.8583461046218872), Type: (sedan)"
+                    - "Color: (golden, prob: 0.8583461046218872), Type: None"
+                    - "Color: None, Type: (sedan)"
+                    - "Color: None, Type: None"
+                TYPE    : String
+                
+            """
+
+            ###########################
+            # Below is the code for separate the prediction output (String) to dictionary of value
+            ###########################
 
             color_value = None
             color_conf = None
             type_value = None
             type_conf = None
 
-            if len(attributes.split(",")) <= 2:
+            if len(attributes.split(",")) <= 2:       # Filter if both none
                 color_value = "unknown"
                 color_conf = -1
 
@@ -55,7 +106,7 @@ if __name__ == '__main__':
             else:
                 index_of_word_type = attributes.index("Type")
 
-                color = attributes[:index_of_word_type]
+                color = attributes[:index_of_word_type]             # Filter 'Color' section
                 if color.find("(") != -1:
                     _color_value = color[color.find("(") + 1:color.find(",")]
                     _color_conf = color[color.find(":", 10) + 2:color.find(")", 10)]
@@ -66,7 +117,7 @@ if __name__ == '__main__':
                     color_value = "unknown"
                     color_conf = -1
 
-                type = attributes[index_of_word_type:]
+                type = attributes[index_of_word_type:]              # Filter 'Type' section
                 if type.find("(") != -1:
                     _type_value = type[type.find("(") + 1:type.find(",")]
                     _type_conf = type[type.find(":", 10) + 2:type.find(")", 10)]
@@ -79,14 +130,33 @@ if __name__ == '__main__':
                     type_conf = -1
 
             # Color Detector
+            """
+                Even though the vehicle attributes paddle library has color detection
+                the result is not satisfactory. We'll use third party way of predicting
+                color of the car.
+                    
+                PAPER   : Robust color object detection using spatial-color joint probability functions
+                URL     : https://ieeexplore.ieee.org/abstract/document/1315057
+            """
             h_car, w_car = car.shape[:2]
-            perc = 0.2
-            # Calculate average color
-            small_area = car[(int(0+h_car*perc)): (int(h_car-h_car*perc)), (int(0+w_car*perc)): (int(w_car-w_car*perc))]
-            cv2.imshow("we", small_area)
-            rgb = np.mean(small_area, axis=(0, 1))  # Average across rows and columns
-            p_col, p_cat = color_detector.predict(rgb)
-            color_value = p_cat
+            # Crop to middle of cropped image of the car
+            crop_percentage = 0.2
+            x1_crop = 0 + h_car * crop_percentage
+            y1_crop = 0 + w_car * crop_percentage
+            x2_crop = h_car - h_car * crop_percentage
+            y2_crop = w_car - w_car * crop_percentage
+            x1_crop, y1_crop, x2_crop, y2_crop = int(x1_crop), int(y1_crop), int(x2_crop), int(y2_crop)
+
+            cropped_area = car[y1_crop:y2_crop, x1_crop:x2_crop]
+
+            # Average pooling
+            average_pooling = calculate_average_pooling(cropped_area)
+            if average_pooling is None:                             # If average pooling error skip this car image
+                continue
+            median = np.median(average_pooling, axis=(0, 1))        # Get the median value of average pooling result
+
+            p_col, p_cat = color_detector.predict(median)           # Predict color (accepted input: RGB array)
+            color_value = p_col
 
             return_value.append({
                 "color": {
@@ -99,13 +169,26 @@ if __name__ == '__main__':
                 }
             })
 
-            # Annotate
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255))
-            # Put text on the image
-            cv2.putText(frame, f"Color: {color_value}", (x1, y1+10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-            cv2.putText(frame, f"Type: {type_value}", (x1, y1+20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            # Preformatted the color value
+            color_value = color_value.split("_")
+            color_value = " ".join(color_value)
+            anchor = sv.Point(x=mid_x, y=y2 - 10)
+            annotated_frame = sv.draw_text(
+                scene=annotated_frame,
+                text=f"{color_value}",
+                text_anchor=anchor,
+                text_color=sv.Color.WHITE
+            )
 
-        cv2.imshow("webcam", frame)
+            anchor = sv.Point(x=mid_x, y=y2 - 20)
+            annotated_frame = sv.draw_text(
+                scene=annotated_frame,
+                text=f"{type_value}",
+                text_anchor=anchor,
+                text_color=sv.Color.WHITE
+            )
+
+        cv2.imshow("webcam", annotated_frame)
         if cv2.waitKey(25) & 0xFF == ord("q"):  # press q to quit
             break
 
