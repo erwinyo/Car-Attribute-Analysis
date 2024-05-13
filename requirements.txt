@@ -2,3 +2,4 @@ ultralytics
 supervision
 paddleclas
 scikit-image
+openpyxl
