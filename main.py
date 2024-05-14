@@ -32,10 +32,13 @@ if __name__ == '__main__':
     vehicle_attribute = VehicleAttribute()
     color_detector = ColorDetector()
     bounding_box_annotator = sv.BoundingBoxAnnotator(
-        color=sv.ColorPalette.DEFAULT
+        color=sv.ColorPalette.from_hex(["#FFFFFF"])
     )
     label_annotator = sv.LabelAnnotator(
-        color=sv.ColorPalette.ROBOFLOW
+        color=sv.ColorPalette.from_hex(["#FFFFFF"]),
+        text_color=sv.Color.BLACK,
+        text_scale=0.35,
+        text_padding=2
     )
 
     cap = cv2.VideoCapture("asset/video/sample#2.mp4")
@@ -44,26 +47,14 @@ if __name__ == '__main__':
         if not has_frame:
             break
         h, w = frame.shape[:2]
-        return_value = []
+        return_value = []       # Will be filled with dictionary of color & type
+        return_color = []       # Will be filled with only color
+        return_type = []        # Will be filled with only type
 
         result_car_detection = yolo.track(frame, classes=[1, 2, 3, 5, 7], conf=0.65)
         detections = sv.Detections.from_ultralytics(result_car_detection)
         if detections.tracker_id is None:
             continue
-
-        # Supervision annotation
-        labels = [
-            f"{tracker_id} {class_name} {confidence:.2f}"
-            for tracker_id, class_name, confidence
-            in zip(detections.tracker_id, detections['class_name'], detections.confidence)
-        ]
-        annotated_frame = bounding_box_annotator.annotate(
-            scene=frame.copy(),
-            detections=detections
-        )
-        annotated_frame = label_annotator.annotate(
-            scene=annotated_frame, detections=detections, labels=labels
-        )
 
         # For loop of vehicle detections
         for x1, y1, x2, y2 in detections.xyxy:
@@ -147,7 +138,7 @@ if __name__ == '__main__':
             y2_crop = w_car - w_car * crop_percentage
             x1_crop, y1_crop, x2_crop, y2_crop = int(x1_crop), int(y1_crop), int(x2_crop), int(y2_crop)
 
-            cropped_area = car[y1_crop:y2_crop, x1_crop:x2_crop]
+            cropped_area = car[y1_crop:y2_crop, x1_crop:x2_crop]       # Cropped region of interest (one car only)
 
             # Average pooling
             average_pooling = calculate_average_pooling(cropped_area)
@@ -169,24 +160,22 @@ if __name__ == '__main__':
                 }
             })
 
-            # Preformatted the color value
-            color_value = color_value.split("_")
-            color_value = " ".join(color_value)
-            anchor = sv.Point(x=mid_x, y=y2 - 10)
-            annotated_frame = sv.draw_text(
-                scene=annotated_frame,
-                text=f"{color_value}",
-                text_anchor=anchor,
-                text_color=sv.Color.WHITE
-            )
+            return_color.append(color_value)
+            return_type.append(type_value)
 
-            anchor = sv.Point(x=mid_x, y=y2 - 20)
-            annotated_frame = sv.draw_text(
-                scene=annotated_frame,
-                text=f"{type_value}",
-                text_anchor=anchor,
-                text_color=sv.Color.WHITE
-            )
+        # Supervision annotation
+        labels = [
+            f"{class_name} | {type} {color}"
+            for tracker_id, class_name, confidence, type, color
+            in zip(detections.tracker_id, detections['class_name'], detections.confidence, return_type, return_color)
+        ]
+        annotated_frame = bounding_box_annotator.annotate(
+            scene=frame.copy(),
+            detections=detections
+        )
+        annotated_frame = label_annotator.annotate(
+            scene=annotated_frame, detections=detections, labels=labels
+        )
 
         cv2.imshow("webcam", annotated_frame)
         if cv2.waitKey(25) & 0xFF == ord("q"):  # press q to quit

@@ -5,4 +5,4 @@
 *.onnx
 *.engine
 
-env
+/env
